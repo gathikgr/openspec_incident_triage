@@ -152,8 +152,8 @@ def escalate_ticket(ticket_title: str, severity: str) -> str:
     return f"Incident Ticket Created: '{ticket_title}' [Severity: {severity.upper()}]. On-call team paged successfully."
 
 SAFE_TOOLS = [query_service_health, search_remediation_runbooks]
-SENSITIVE_TOOLS = [escalate_ticket]
-ALL_TOOLS = SAFE_TOOLS + SENSITIVE_TOOLS
+SENSITIVE_TOOL_NAMES = {"escalate_ticket"}
+ALL_TOOLS = [query_service_health, search_remediation_runbooks, escalate_ticket]
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
@@ -179,9 +179,10 @@ def create_agent_node(llm, tools):
     return agent_node
 
 def route_tools(state: AgentState) -> str:
+    """Harden routing: if ANY tool call is sensitive, route through the approval interrupt."""
     last_message = state["messages"][-1]
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        if last_message.tool_calls[0]["name"] == "escalate_ticket":
+        if any(tc.get("name") in SENSITIVE_TOOL_NAMES for tc in last_message.tool_calls):
             return "sensitive_tools"
         return "safe_tools"
     return END
@@ -192,7 +193,8 @@ def get_agent_app(llm_override=None, checkpointer=None, db_pool=None):
     
     workflow.add_node("agent", create_agent_node(llm, ALL_TOOLS))
     workflow.add_node("safe_tools", ToolNode(SAFE_TOOLS))
-    workflow.add_node("sensitive_tools", ToolNode(SENSITIVE_TOOLS))
+    # Sensitive node has access to ALL_TOOLS so mixed batches execute once approved
+    workflow.add_node("sensitive_tools", ToolNode(ALL_TOOLS))
     
     workflow.add_edge(START, "agent")
     workflow.add_conditional_edges("agent", route_tools, {
@@ -203,7 +205,6 @@ def get_agent_app(llm_override=None, checkpointer=None, db_pool=None):
     workflow.add_edge("safe_tools", "agent")
     workflow.add_edge("sensitive_tools", "agent")
     
-    # Checkpointer selection
     if checkpointer is not None:
         cp = checkpointer
     elif db_pool is not None and PostgresSaver is not None:
@@ -234,7 +235,7 @@ def approve_thread(app, thread_id: str):
     return app.invoke(None, config)
 
 def reject_thread(app, thread_id: str, reason: str = "Rejected by on-call engineer."):
-    """Reject pending sensitive tool call by injecting ToolMessage feedback and resuming agent."""
+    """Reject pending sensitive tool calls by injecting ToolMessages for every pending call and resuming."""
     config = {"configurable": {"thread_id": thread_id}}
     state = app.get_state(config)
     if not state or not state.values.get("messages"):
@@ -244,14 +245,14 @@ def reject_thread(app, thread_id: str, reason: str = "Rejected by on-call engine
     if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
         raise ValueError(f"No pending tool calls found for thread_id '{thread_id}'")
     
-    tool_messages = []
-    for tc in last_message.tool_calls:
-        tool_messages.append(
-            ToolMessage(
-                content=f"Rejected by engineer: {reason}",
-                tool_call_id=tc["id"]
-            )
+    # Generate ToolMessage for EVERY pending tool call in the message
+    tool_messages = [
+        ToolMessage(
+            content=f"Rejected by engineer: {reason}",
+            tool_call_id=tc["id"]
         )
+        for tc in last_message.tool_calls
+    ]
     
     app.update_state(config, {"messages": tool_messages}, as_node="sensitive_tools")
     return app.invoke(None, config)

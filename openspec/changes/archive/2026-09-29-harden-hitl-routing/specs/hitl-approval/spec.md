@@ -1,9 +1,6 @@
-# hitl-approval Specification
+# Delta for hitl-approval
 
-## Purpose
-TBD - created by archiving change add-hitl-escalation. Update Purpose after archive.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Sensitive actions require human approval
 The agent MUST pause before executing a model message if ANY of its tool calls is sensitive, and MUST NOT execute any sensitive tool without explicit approval for that thread.
