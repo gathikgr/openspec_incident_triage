@@ -132,6 +132,10 @@ class ApprovalRequest(BaseModel):
     approved: bool = Field(..., description="True to approve execution, False to reject")
     rejection_reason: Optional[str] = Field(None, description="Reason for rejection when approved is False")
 
+@fastapi_app.get("/healthz")
+def healthz_endpoint():
+    return {"status": "ok", "service": "incident-triage-agent"}
+
 @fastapi_app.post("/chat")
 def chat_endpoint(req: ChatRequest):
     try:
