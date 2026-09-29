@@ -218,14 +218,19 @@ def get_agent_app(llm_override=None, checkpointer=None, db_pool=None):
         cp.setup()
     elif os.getenv("DATABASE_URL") and PostgresSaver is not None:
         try:
+            db_url = os.getenv("DATABASE_URL")
+            # Quick connectivity test to avoid hanging the web UI on invalid credentials
+            with psycopg.connect(db_url, connect_timeout=3, prepare_threshold=None) as test_conn:
+                pass
             pool = ConnectionPool(
-                os.getenv("DATABASE_URL"),
+                db_url,
                 max_size=10,
-                kwargs={"autocommit": True, "prepare_threshold": None, "connect_timeout": 15}
+                kwargs={"autocommit": True, "prepare_threshold": None, "connect_timeout": 5}
             )
             cp = PostgresSaver(pool)
             cp.setup()
-        except Exception:
+        except Exception as e:
+            print(f"[Warning] Database connection unavailable ({e}). Running with in-memory checkpointer.")
             cp = MemorySaver()
     else:
         cp = MemorySaver()
