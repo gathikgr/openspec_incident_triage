@@ -94,6 +94,27 @@ def query_service_health(service: str) -> str:
         )
     return f"Service '{service}' status: HEALTHY (No active alerts or degradation found)."
 
+def _fallback_runbook_search(query: str, service: Optional[str] = None) -> str:
+    from seed_rag import RUNBOOKS
+    matches = []
+    query_terms = query.lower().split()
+    for rb in RUNBOOKS:
+        if service and rb["service"].lower() != service.lower():
+            continue
+        text = (rb["title"] + " " + rb["content"]).lower()
+        score = sum(1 for term in query_terms if term in text)
+        if score > 0 or not service or rb["service"].lower() == (service or "").lower():
+            matches.append(rb)
+    
+    top_matches = matches[:2]
+    if not top_matches:
+        return "No relevant runbooks found."
+    
+    results = []
+    for i, m in enumerate(top_matches, 1):
+        results.append(f"[{i}] {m['title']} (Service: {m['service']}):\n{m['content']}")
+    return "\n\n".join(results)
+
 @tool
 def search_remediation_runbooks(query: str, service: Optional[str] = None) -> str:
     """Search pgvector incident runbooks database for relevant remediation procedures."""
@@ -101,29 +122,12 @@ def search_remediation_runbooks(query: str, service: Optional[str] = None) -> st
     api_key = os.getenv("GEMINI_API_KEY")
 
     if not db_url or not api_key:
-        from seed_rag import RUNBOOKS
-        matches = []
-        query_terms = query.lower().split()
-        for rb in RUNBOOKS:
-            if service and rb["service"].lower() != service.lower():
-                continue
-            text = (rb["title"] + " " + rb["content"]).lower()
-            score = sum(1 for term in query_terms if term in text)
-            if score > 0 or not service or rb["service"].lower() == (service or "").lower():
-                matches.append(rb)
-        
-        top_matches = matches[:2]
-        if not top_matches:
-            return "No relevant runbooks found."
-        
-        results = []
-        for i, m in enumerate(top_matches, 1):
-            results.append(f"[{i}] {m['title']} (Service: {m['service']}):\n{m['content']}")
-        return "\n\n".join(results)
+        return _fallback_runbook_search(query, service)
 
     try:
+        embedding_model = os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004")
         embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
+            model=embedding_model,
             google_api_key=api_key,
             task_type="RETRIEVAL_QUERY"
         )
@@ -143,8 +147,9 @@ def search_remediation_runbooks(query: str, service: Optional[str] = None) -> st
                 for i, r in enumerate(rows, 1):
                     results.append(f"[{i}] {r[0]} (Service: {r[1]}, Similarity: {r[3]:.2f}):\n{r[2]}")
                 return "\n\n".join(results)
-    except Exception as e:
-        return f"Error querying runbooks: {str(e)}"
+    except Exception:
+        # Gracefully fall back to in-memory runbook search
+        return _fallback_runbook_search(query, service)
 
 @tool
 def escalate_ticket(ticket_title: str, severity: str) -> str:
@@ -162,8 +167,9 @@ def get_llm(model_override=None):
     if model_override:
         return model_override
     api_key = os.getenv("GEMINI_API_KEY") or "dummy-key"
+    model_name = os.getenv("GEMINI_MODEL", "models/gemini-3.8-flash")
     return ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
+        model=model_name,
         google_api_key=api_key,
         temperature=0.0
     )
