@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Annotated, Sequence, TypedDict, Any, List, Optional
+from typing import Annotated, Sequence, TypedDict, Any, List, Optional, Dict
 from dotenv import load_dotenv
 
 import psycopg
@@ -20,17 +20,17 @@ except ImportError:
 
 load_dotenv()
 
-# System prompt enforcing health-first investigation
+# System prompt enforcing health check -> runbook search -> resolution/escalation workflow
 SYSTEM_PROMPT = (
     "You are an Autonomous Incident Triage Agent for cloud systems. "
     "Your objective is to investigate incidents, diagnose root causes, and propose remediation. "
     "MANDATORY WORKFLOW: "
     "1. Always check service health first using `query_service_health`. "
     "2. Next, search relevant remediation runbooks using `search_remediation_runbooks`. "
-    "3. Analyze findings and present a clear incident summary and diagnosis."
+    "3. Analyze findings. If manual engineer intervention is required or service is severely degraded, "
+    "call `escalate_ticket` to create an emergency ticket. Note that `escalate_ticket` requires human approval."
 )
 
-# Mocked service status data
 SERVICES_HEALTH_DB = {
     "auth": {
         "status": "DEGRADED",
@@ -100,7 +100,6 @@ def search_remediation_runbooks(query: str, service: Optional[str] = None) -> st
     db_url = os.getenv("DATABASE_URL")
     api_key = os.getenv("GEMINI_API_KEY")
 
-    # Fallback / mock when DB or API key is not configured
     if not db_url or not api_key:
         from seed_rag import RUNBOOKS
         matches = []
@@ -147,7 +146,14 @@ def search_remediation_runbooks(query: str, service: Optional[str] = None) -> st
     except Exception as e:
         return f"Error querying runbooks: {str(e)}"
 
+@tool
+def escalate_ticket(ticket_title: str, severity: str) -> str:
+    """CRITICAL: Escalate incident to on-call engineering team and create high-priority paging ticket."""
+    return f"Incident Ticket Created: '{ticket_title}' [Severity: {severity.upper()}]. On-call team paged successfully."
+
 SAFE_TOOLS = [query_service_health, search_remediation_runbooks]
+SENSITIVE_TOOLS = [escalate_ticket]
+ALL_TOOLS = SAFE_TOOLS + SENSITIVE_TOOLS
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
@@ -155,10 +161,7 @@ class AgentState(TypedDict):
 def get_llm(model_override=None):
     if model_override:
         return model_override
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        # Fallback dummy for initialization when key is not set
-        api_key = "dummy-key"
+    api_key = os.getenv("GEMINI_API_KEY") or "dummy-key"
     return ChatGoogleGenerativeAI(
         model="gemini-2.0-flash",
         google_api_key=api_key,
@@ -178,6 +181,8 @@ def create_agent_node(llm, tools):
 def route_tools(state: AgentState) -> str:
     last_message = state["messages"][-1]
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        if last_message.tool_calls[0]["name"] == "escalate_ticket":
+            return "sensitive_tools"
         return "safe_tools"
     return END
 
@@ -185,15 +190,18 @@ def get_agent_app(llm_override=None, checkpointer=None, db_pool=None):
     llm = get_llm(llm_override)
     workflow = StateGraph(AgentState)
     
-    workflow.add_node("agent", create_agent_node(llm, SAFE_TOOLS))
+    workflow.add_node("agent", create_agent_node(llm, ALL_TOOLS))
     workflow.add_node("safe_tools", ToolNode(SAFE_TOOLS))
+    workflow.add_node("sensitive_tools", ToolNode(SENSITIVE_TOOLS))
     
     workflow.add_edge(START, "agent")
     workflow.add_conditional_edges("agent", route_tools, {
         "safe_tools": "safe_tools",
+        "sensitive_tools": "sensitive_tools",
         END: END
     })
     workflow.add_edge("safe_tools", "agent")
+    workflow.add_edge("sensitive_tools", "agent")
     
     # Checkpointer selection
     if checkpointer is not None:
@@ -215,4 +223,35 @@ def get_agent_app(llm_override=None, checkpointer=None, db_pool=None):
     else:
         cp = MemorySaver()
         
-    return workflow.compile(checkpointer=cp)
+    return workflow.compile(
+        checkpointer=cp,
+        interrupt_before=["sensitive_tools"]
+    )
+
+def approve_thread(app, thread_id: str):
+    """Resume execution of an interrupted sensitive tool call."""
+    config = {"configurable": {"thread_id": thread_id}}
+    return app.invoke(None, config)
+
+def reject_thread(app, thread_id: str, reason: str = "Rejected by on-call engineer."):
+    """Reject pending sensitive tool call by injecting ToolMessage feedback and resuming agent."""
+    config = {"configurable": {"thread_id": thread_id}}
+    state = app.get_state(config)
+    if not state or not state.values.get("messages"):
+        raise ValueError(f"No active state found for thread_id '{thread_id}'")
+    
+    last_message = state.values["messages"][-1]
+    if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
+        raise ValueError(f"No pending tool calls found for thread_id '{thread_id}'")
+    
+    tool_messages = []
+    for tc in last_message.tool_calls:
+        tool_messages.append(
+            ToolMessage(
+                content=f"Rejected by engineer: {reason}",
+                tool_call_id=tc["id"]
+            )
+        )
+    
+    app.update_state(config, {"messages": tool_messages}, as_node="sensitive_tools")
+    return app.invoke(None, config)
